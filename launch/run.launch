@@ -1,0 +1,7 @@
+<launch>
+
+    <node name="bullet_drones_node" pkg="ros_pybullet_drones" type="test_gym_env.py" output="screen" required="true"/>
+
+    <node name="rvizvisualisation" pkg="rviz" type="rviz" output="log" args="-d $(find ros_pybullet_drones)/config/rviz.rviz" />
+
+</launch>
