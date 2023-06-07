@@ -40,6 +40,7 @@ class BulletDronesEnv(gym.Env):
                  use_gui=False,
                  boundary_size=(20, 20, 3),
                  init_formation="circle",
+                 normalize_obs=True,
                  **kwargs
                  ):
         """
@@ -69,8 +70,8 @@ class BulletDronesEnv(gym.Env):
         self.TAKEOFF_HEIGHT = takeoff_height
         self.planner = None
         self.curr_plan_time = 0.
-        self.action = np.zeros(3) # vel_cmd
-        self.curr_goal = np.zeros(3)
+        self.action = np.zeros((self.NUM_DRONES, 3)) # vel_cmd
+        self.curr_goal = np.full(3, np.nan)
         self.rpms = np.zeros((self.NUM_DRONES, 4))
         self.last_rpms = np.zeros((self.NUM_DRONES, 4))
         XLIM, YLIM, ZLIM = boundary_size
@@ -80,6 +81,7 @@ class BulletDronesEnv(gym.Env):
         self.USE_GUI = use_gui
         self.PHYSICS = physics
         self.URDF = self.DRONE_MODEL.value + ".urdf"
+        self.normalize_obs = normalize_obs
         # load the drone properties from the .urdf file
         self.M, \
         self.L, \
@@ -185,6 +187,19 @@ class BulletDronesEnv(gym.Env):
 
             self.mesh_msgs[i].mesh_resource = "package://ros_pybullet_drones/gym_bullet_drones/gym_bullet_drones/meshes/hummingbird.mesh"
 
+        self.goal_sub = rospy.Subscriber("/move_base_simple/goal", PoseStamped, self._goal_sub_callback, queue_size=1)
+        self.goal_pub = rospy.Publisher("/goal_visualization", Marker, queue_size=10)
+        self.goal_marker = Marker()
+        self.goal_marker.type = Marker.SPHERE
+        self.goal_marker.header.frame_id = "map"
+        self.goal_marker.scale.x = 0.2
+        self.goal_marker.scale.y = 0.2
+        self.goal_marker.scale.z = 0.2
+        self.goal_marker.color.r = 1.0
+        self.goal_marker.color.g = 0.0
+        self.goal_marker.color.b = 0.0
+        self.goal_marker.color.a = 1.0
+
         # background bullet sim thread
         self.sim_step = 0
         self.bullet_sim_mutex = threading.Lock()
@@ -232,6 +247,20 @@ class BulletDronesEnv(gym.Env):
 
             self.sim_sleeper.sleep()
 
+    def _goal_sub_callback(self, msg):
+        self.curr_goal = np.array(
+            [
+                msg.pose.position.x,
+                msg.pose.position.y,
+                msg.pose.position.z
+            ]
+        )
+        
+        self.goal_marker.action = Marker.ADD
+        self.goal_marker.pose.position.x = self.curr_goal[0]
+        self.goal_marker.pose.position.y = self.curr_goal[1]
+        self.goal_marker.pose.position.z = self.curr_goal[2]
+        self.goal_pub.publish(self.goal_marker)
 
     def _pose_odom_pub_callback(self, event):
         with self.bullet_sim_mutex:
@@ -554,25 +583,60 @@ class BulletDronesEnv(gym.Env):
         return M, L, THRUST2WEIGHT_RATIO, J, J_INV, KF, KM, COLLISION_H, COLLISION_R, COLLISION_Z_OFFSET, MAX_SPEED_KMH, \
                GND_EFF_COEFF, PROP_RADIUS, DRAG_COEFF, DW_COEFF_1, DW_COEFF_2, DW_COEFF_3
     
+    def _getAdjacencyMatrix(self):
+        """Computes the adjacency matrix of a multi-drone system.
+
+        Attribute NEIGHBOURHOOD_RADIUS is used to determine neighboring relationships.
+
+        Returns
+        -------
+        ndarray
+            (NUM_DRONES, NUM_DRONES)-shaped array of 0's and 1's representing the adjacency matrix 
+            of the system: adj_mat[i,j] == 1 if (i, j) are neighbors; == 0 otherwise.
+
+        """
+        # adjacency_mat = np.identity(self.NUM_DRONES)
+        # for i in range(self.NUM_DRONES-1):
+        #     for j in range(self.NUM_DRONES-i-1):
+        #         if np.linalg.norm(self.pos[i, :]-self.pos[j+i+1, :]) < self.NEIGHBOURHOOD_RADIUS:
+        #             adjacency_mat[i, j+i+1] = adjacency_mat[j+i+1, i] = 1
+        # return adjacency_mat
+        diff = np.reshape(self.pos, (self.NUM_DRONES, 1, 3)) - np.reshape(self.pos, (1, self.NUM_DRONES, 3))
+        r2 = np.multiply(diff[:, :, 0], diff[:, :, 0]) + np.multiply(diff[:, :, 1], diff[:, :, 1])
+        np.fill_diagonal(r2, np.inf)
+        adjacency_mat = (r2 < self.NEIGHBORHOOD_RADIUS).astype(np.float32)
+        return adjacency_mat
+
     def _computeObs(self):
         """Returns the current observation of the environment.
 
         Normalize the observation w.r.t. the global frame
         """
         obs = []
-        for i in range(self.NUM_DRONES):
-            norm_pos = np.multiply(np.divide(self.pos[i, :]-self.boundary[0, :], self.boundary[1, :]-self.boundary[0, :]), 
-                                   self.observation_space["state"].high[:3]-self.observation_space["state"].low[:3]) + self.observation_space["state"].low[:3]
-            norm_goal = np.multiply(np.divide(self.curr_goal-self.boundary[0, :], self.boundary[1, :]-self.boundary[0, :]), 
-                                   self.observation_space["goal"].high[:3]-self.observation_space["goal"].low[:3]) + self.observation_space["goal"].low[:3]
-            norm_vel_xy = self.vel[i, :2] / MAX_LIN_VEL_XY
-            norm_vel_z = self.vel[i, 2] / MAX_LIN_VEL_Z
+        if self.normalize_obs:
+            for i in range(self.NUM_DRONES):
+                norm_pos = np.multiply(np.divide(self.pos[i, :]-self.boundary[0, :], self.boundary[1, :]-self.boundary[0, :]), 
+                                    self.observation_space["state"].high[:3]-self.observation_space["state"].low[:3]) + self.observation_space["state"].low[:3]
+                if np.any(np.isnan(self.curr_goal)):
+                    norm_goal = self.curr_goal
+                else:
+                    norm_goal = np.multiply(np.divide(self.curr_goal-self.boundary[0, :], self.boundary[1, :]-self.boundary[0, :]), 
+                                        self.observation_space["goal"].high[:3]-self.observation_space["goal"].low[:3]) + self.observation_space["goal"].low[:3]
+                norm_vel_xy = self.vel[i, :2] / MAX_LIN_VEL_XY
+                norm_vel_z = self.vel[i, 2] / MAX_LIN_VEL_Z
 
-            temp = {
-                "state": np.hstack([norm_pos, self.quat[i, :], norm_vel_xy, norm_vel_z]),
-                "goal": norm_goal
-            }
-            obs.append(temp)
+                temp = {
+                    "state": np.hstack([norm_pos, self.quat[i, :], norm_vel_xy, norm_vel_z]),
+                    "goal": norm_goal
+                }
+                obs.append(temp)
+        else:
+            for i in range(self.NUM_DRONES):
+                temp = {
+                    "state": np.hstack([self.pos[i, :], self.quat[i, :], self.vel[i, :], self.ang_v[i, :]]),
+                    "goal": self.curr_goal
+                }
+                obs.append(temp)
         return obs
 
     def _computeReward(self):
@@ -656,6 +720,12 @@ class BulletDronesEnv(gym.Env):
     def setGoal(self, new_goal):
         self.curr_goal = new_goal
 
+        self.goal_marker.action = Marker.ADD
+        self.goal_marker.pose.position.x = self.curr_goal[0]
+        self.goal_marker.pose.position.y = self.curr_goal[1]
+        self.goal_marker.pose.position.z = self.curr_goal[2]
+        self.goal_pub.publish(self.goal_marker)
+
     def plan(self, obs):
         """Plan action based on current observation"""
         t0 = time.time()
@@ -681,14 +751,12 @@ class BulletDronesEnv(gym.Env):
             The initial observation, check the specific implementation of `_computeObs()`
             in each subclass for its format.
         """
-        rospy.logwarn("[Resetting]")
         with self.bullet_sim_condition:
             self.is_resetting = True
             with self.bullet_sim_mutex:
                 p.resetSimulation(physicsClientId=self.CLIENT)
                 self._housekeeping()
                 self._updateStateInformation()
-                rospy.logwarn("[Housekeeping and resetting]")
             self.is_resetting = False
             self.bullet_sim_condition.notify_all()
         return self._computeObs()
@@ -721,7 +789,7 @@ class BulletDronesEnv(gym.Env):
         """
         with self.bullet_sim_mutex:
             self.action = action
-        time.sleep(self.PLAN_TIMESTEP - self.curr_plan_time)
+        time.sleep(self.PLAN_TIMESTEP - self.curr_plan_time if self.PLAN_TIMESTEP > self.curr_plan_time else self.PLAN_TIMESTEP)
         obs = self._computeObs()
         reward = self._computeReward()
         done = self._computeDone()
