@@ -1,6 +1,15 @@
 <launch>
 
-    <node name="bullet_drones_node" pkg="ros_pybullet_drones" type="test_gym_env.py" output="screen" required="true"/>
+    <arg name="use_flocking_controller" default="false"/>
+    <arg name="use_bullet_gui" default="false"/>
+    <arg name="num_drones" default="10"/>
+
+    <node name="bullet_drones_node" pkg="ros_pybullet_drones" type="test_gym_env.py" output="screen" required="true">
+        <param name="planner_type" value="flocking_controller" if="$(arg use_flocking_controller)"/>
+        <param name="planner_type" value="simple_planner" unless="$(arg use_flocking_controller)"/>
+        <param name="use_bullet_gui" value="$(arg use_bullet_gui)"/>
+        <param name="num_drones" value="$(arg num_drones)"/>
+    </node>
 
     <node name="rvizvisualisation" pkg="rviz" type="rviz" output="log" args="-d $(find ros_pybullet_drones)/config/rviz.rviz" />
 
